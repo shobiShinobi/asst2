@@ -2,6 +2,11 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -34,6 +39,9 @@ class TaskSystemParallelSpawn: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        int num_threads_;
 };
 
 /*
@@ -51,6 +59,22 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        void workerLoop(int tid);
+
+        int num_threads_;
+        int pool_size_;
+        std::vector<std::thread> workers_;
+
+        std::atomic<bool> shutdown_;
+        IRunnable* runnable_;
+        int total_;
+        std::atomic<int> next_;
+        std::atomic<int> finished_;
+        std::atomic<int> generation_;
+        std::atomic<int> workers_idle_;
+        std::mutex mutex_;
 };
 
 /*
@@ -68,6 +92,30 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        void workerLoop(int tid);
+        void executeRange(int tid, IRunnable* runnable, int total);
+        void noteFinished(int count);
+
+        int num_threads_;
+        int pool_size_;
+        std::vector<std::thread> workers_;
+
+        bool waitForLaunch(int my_gen);
+
+        std::mutex mutex_;
+        std::condition_variable work_cv_;
+        std::condition_variable done_cv_;
+        std::atomic<bool> shutdown_;
+        std::atomic<int> generation_;
+        std::atomic<int> workers_idle_;
+        int sleepers_;
+
+        IRunnable* runnable_;
+        int total_;
+        std::atomic<int> next_;
+        std::atomic<int> finished_;
 };
 
 #endif
