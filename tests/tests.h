@@ -58,59 +58,356 @@ typedef struct {
  * ==================================================================
 */
 /*
- * Implement your task here
-*/
-class YourTask : public IRunnable {
-    public:
-        YourTask() {}
-        ~YourTask() {}
-        void runTask(int task_id, int num_total_tasks) {}
-};
-/*
- * Implement your test here. Call this function from a wrapper that passes in
- * do_async and num_elements. See `simpleTest`, `simpleTestSync`, and
- * `simpleTestAsync` as an example.
+ * Custom test: edge cases.
+ *
+ * Prediction, written before looking at timings:
+ * async should match sync on the tiny tasks, because there is almost
+ * no overlapping work. A missed wake-up hangs the test.
  */
-TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bulk_task_launches) {
-    // TODO: initialize your input and output buffers
-    int* output = new int[num_elements];
 
-    // TODO: instantiate your bulk task launches
-
-    // Run the test
-    double start_time = CycleTimer::currentSeconds();
-    if (do_async) {
-        // TODO:
-        // initialize dependency vector
-        // make calls to t->runAsyncWithDeps and push TaskID to dependency vector
-        // t->sync() at end
-    } else {
-        // TODO: make calls to t->run
+static int busyMix(int iters, int seed) {
+    int x = seed + 1;
+    for (int i = 0; i < iters; i++) {
+        x = x * 1664525 + 1013904223;
     }
-    double end_time = CycleTimer::currentSeconds();
+    return x;
+}
 
-    // Correctness validation
+class EdgeLaunch : public IRunnable {
+    public:
+        int expected_n;
+        int work_iters;
+        int seed;
+        std::atomic<int>* hits;
+        std::atomic<int>* bad_n;
+        std::atomic<long long>* clock;
+        std::atomic<long long>* start_at;
+        std::atomic<long long>* finish_at;
+        int* out;
+
+        EdgeLaunch()
+            : expected_n(0), work_iters(0), seed(0), hits(NULL), bad_n(NULL),
+              clock(NULL), start_at(NULL), finish_at(NULL), out(NULL) {}
+
+        void runTask(int task_id, int num_total_tasks) {
+            if (num_total_tasks != expected_n) {
+                bad_n->fetch_add(1, std::memory_order_relaxed);
+            }
+            if (clock != NULL) {
+                long long s = clock->fetch_add(1, std::memory_order_relaxed);
+                start_at[task_id].store(s, std::memory_order_relaxed);
+            }
+            int x = busyMix(work_iters, seed + task_id);
+            if (out != NULL) {
+                out[task_id] = x;
+            }
+            hits[task_id].fetch_add(1, std::memory_order_relaxed);
+            if (clock != NULL) {
+                long long f = clock->fetch_add(1, std::memory_order_relaxed);
+                finish_at[task_id].store(f, std::memory_order_relaxed);
+            }
+        }
+};
+
+static bool hitsMatch(std::atomic<int>* hits, int* out, int n, int work_iters, int seed) {
+    for (int i = 0; i < n; i++) {
+        if (hits[i].load(std::memory_order_relaxed) != 1) {
+            return false;
+        }
+        if (out != NULL && out[i] != busyMix(work_iters, seed + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool stampsAfter(std::atomic<long long>* earlier_finish, int n_early,
+                        std::atomic<long long>* later_start, int n_late) {
+    long long max_finish = 0;
+    for (int i = 0; i < n_early; i++) {
+        long long f = earlier_finish[i].load(std::memory_order_relaxed);
+        if (f <= 0) {
+            return false;
+        }
+        if (f > max_finish) {
+            max_finish = f;
+        }
+    }
+    for (int i = 0; i < n_late; i++) {
+        long long s = later_start[i].load(std::memory_order_relaxed);
+        if (s <= max_finish) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Sync: N=1, fewer tasks than threads, one huge cheap launch, and 1000
+ * back-to-back launches of different sizes.
+ * Async: those, plus duplicate deps, a dependency on a launch that has
+ * already been sync'd, sync() with nothing left, and a second sync().
+ * Ordering uses a global counter: a task may start only after every
+ * task in its dependencies has finished.
+ */
+TestResults customEdgeCases(ITaskSystem* t, bool do_async) {
     TestResults results;
     results.passed = true;
+    std::atomic<int> bad_n(0);
+    double start_time = CycleTimer::currentSeconds();
 
-    for (int i=0; i<num_elements; i++) {
-        int value = 0; // TODO: initialize value
-        for (int j=0; j<num_bulk_task_launches; j++) {
-            // TODO: update value as expected
+    if (do_async) {
+        t->sync();
+        t->sync();
+    }
+
+    // --- N = 1, and a launch smaller than a typical thread count ---
+    const int small_ns[2] = {1, 3};
+    for (int s = 0; s < 2; s++) {
+        int n = small_ns[s];
+        std::atomic<int>* hits = new std::atomic<int>[n];
+        int* out = new int[n];
+        for (int i = 0; i < n; i++) {
+            hits[i].store(0, std::memory_order_relaxed);
         }
-
-        int expected = value;
-        if (output[i] != expected) {
+        EdgeLaunch task;
+        task.expected_n = n;
+        task.work_iters = 2000;
+        task.seed = 1000 + n;
+        task.hits = hits;
+        task.bad_n = &bad_n;
+        task.out = out;
+        if (do_async) {
+            std::vector<TaskID> deps;
+            t->runAsyncWithDeps(&task, n, deps);
+            t->sync();
+        } else {
+            t->run(&task, n);
+        }
+        if (!hitsMatch(hits, out, n, task.work_iters, task.seed)) {
             results.passed = false;
-            printf("%d: %d expected=%d\n", i, output[i], expected);
-            break;
+            printf("edge: small launch N=%d failed\n", n);
+        }
+        delete [] hits;
+        delete [] out;
+    }
+
+    // --- one launch of >= 100000 cheap tasks ---
+    {
+        const int n = 100000;
+        const int iters = 2000;
+        std::atomic<int>* hits = new std::atomic<int>[n];
+        for (int i = 0; i < n; i++) {
+            hits[i].store(0, std::memory_order_relaxed);
+        }
+        EdgeLaunch task;
+        task.expected_n = n;
+        task.work_iters = iters;
+        task.seed = 42;
+        task.hits = hits;
+        task.bad_n = &bad_n;
+        if (do_async) {
+            std::vector<TaskID> deps;
+            t->runAsyncWithDeps(&task, n, deps);
+            t->sync();
+        } else {
+            t->run(&task, n);
+        }
+        if (!hitsMatch(hits, NULL, n, iters, 42)) {
+            results.passed = false;
+            printf("edge: 100000-task launch failed\n");
+        }
+        delete [] hits;
+    }
+
+    // --- >= 1000 launches, sizes cycling through 1..32 ---
+    {
+        const int launches = 1000;
+        std::vector<EdgeLaunch> tasks(launches);
+        std::vector<std::atomic<int>*> hits(launches);
+        std::vector<int> ns(launches);
+        std::vector<int*> outs(launches);
+        for (int i = 0; i < launches; i++) {
+            int n = (i % 32) + 1;
+            ns[i] = n;
+            hits[i] = new std::atomic<int>[n];
+            outs[i] = new int[n];
+            for (int j = 0; j < n; j++) {
+                hits[i][j].store(0, std::memory_order_relaxed);
+            }
+            tasks[i].expected_n = n;
+            tasks[i].work_iters = 40;
+            tasks[i].seed = 5000 + i;
+            tasks[i].hits = hits[i];
+            tasks[i].bad_n = &bad_n;
+            tasks[i].out = outs[i];
+        }
+        if (do_async) {
+            std::vector<TaskID> deps;
+            for (int i = 0; i < launches; i++) {
+                t->runAsyncWithDeps(&tasks[i], ns[i], deps);
+            }
+            t->sync();
+        } else {
+            for (int i = 0; i < launches; i++) {
+                t->run(&tasks[i], ns[i]);
+            }
+        }
+        for (int i = 0; i < launches; i++) {
+            if (!hitsMatch(hits[i], outs[i], ns[i], tasks[i].work_iters, tasks[i].seed)) {
+                results.passed = false;
+                printf("edge: varying launch %d failed\n", i);
+                break;
+            }
+        }
+        for (int i = 0; i < launches; i++) {
+            delete [] hits[i];
+            delete [] outs[i];
         }
     }
-    results.time = end_time - start_time;
 
-    delete [] output;
+    // Duplicate dependency, dependency on an already-finished launch,
+    // and start/finish ordering across the edge.
+    if (do_async) {
+        const int n = 24;
+        std::atomic<long long> clock(1);
+        std::atomic<int>* hits_a = new std::atomic<int>[n];
+        std::atomic<int>* hits_b = new std::atomic<int>[n];
+        std::atomic<int>* hits_c = new std::atomic<int>[n];
+        std::atomic<long long>* start_a = new std::atomic<long long>[n];
+        std::atomic<long long>* finish_a = new std::atomic<long long>[n];
+        std::atomic<long long>* start_b = new std::atomic<long long>[n];
+        std::atomic<long long>* finish_b = new std::atomic<long long>[n];
+        std::atomic<long long>* start_c = new std::atomic<long long>[n];
+        std::atomic<long long>* finish_c = new std::atomic<long long>[n];
+        for (int i = 0; i < n; i++) {
+            hits_a[i].store(0, std::memory_order_relaxed);
+            hits_b[i].store(0, std::memory_order_relaxed);
+            hits_c[i].store(0, std::memory_order_relaxed);
+            start_a[i].store(0, std::memory_order_relaxed);
+            finish_a[i].store(0, std::memory_order_relaxed);
+            start_b[i].store(0, std::memory_order_relaxed);
+            finish_b[i].store(0, std::memory_order_relaxed);
+            start_c[i].store(0, std::memory_order_relaxed);
+            finish_c[i].store(0, std::memory_order_relaxed);
+        }
+        EdgeLaunch a, b, c;
+        a.expected_n = b.expected_n = c.expected_n = n;
+        a.work_iters = b.work_iters = c.work_iters = 300;
+        a.seed = 11;
+        b.seed = 22;
+        c.seed = 33;
+        a.hits = hits_a;
+        b.hits = hits_b;
+        c.hits = hits_c;
+        a.bad_n = b.bad_n = c.bad_n = &bad_n;
+        a.clock = b.clock = c.clock = &clock;
+        a.start_at = start_a;
+        a.finish_at = finish_a;
+        b.start_at = start_b;
+        b.finish_at = finish_b;
+        c.start_at = start_c;
+        c.finish_at = finish_c;
 
+        std::vector<TaskID> no_deps;
+        TaskID id_a = t->runAsyncWithDeps(&a, n, no_deps);
+        t->sync();
+
+        // A is already complete. Listing it twice must not block C,
+        // and C must still start after A.
+        std::vector<TaskID> dep_a;
+        dep_a.push_back(id_a);
+        dep_a.push_back(id_a);
+        TaskID id_c = t->runAsyncWithDeps(&c, n, dep_a);
+
+        // B depends on A twice as well, issued after A finished.
+        TaskID id_b = t->runAsyncWithDeps(&b, n, dep_a);
+        (void)id_b;
+        (void)id_c;
+        t->sync();
+        t->sync();
+
+        if (!hitsMatch(hits_a, NULL, n, a.work_iters, a.seed) ||
+            !hitsMatch(hits_b, NULL, n, b.work_iters, b.seed) ||
+            !hitsMatch(hits_c, NULL, n, c.work_iters, c.seed) ||
+            !stampsAfter(finish_a, n, start_b, n) ||
+            !stampsAfter(finish_a, n, start_c, n)) {
+            results.passed = false;
+            printf("edge: dependency cases failed\n");
+        }
+
+        // A live edge, not one that was synced first: B2 waits on A2.
+        EdgeLaunch a2, b2;
+        std::atomic<int>* hits_a2 = new std::atomic<int>[n];
+        std::atomic<int>* hits_b2 = new std::atomic<int>[n];
+        std::atomic<long long>* start_b2 = new std::atomic<long long>[n];
+        std::atomic<long long>* finish_a2 = new std::atomic<long long>[n];
+        std::atomic<long long>* start_a2 = new std::atomic<long long>[n];
+        std::atomic<long long>* finish_b2 = new std::atomic<long long>[n];
+        for (int i = 0; i < n; i++) {
+            hits_a2[i].store(0, std::memory_order_relaxed);
+            hits_b2[i].store(0, std::memory_order_relaxed);
+            start_a2[i].store(0, std::memory_order_relaxed);
+            finish_a2[i].store(0, std::memory_order_relaxed);
+            start_b2[i].store(0, std::memory_order_relaxed);
+            finish_b2[i].store(0, std::memory_order_relaxed);
+        }
+        a2.expected_n = b2.expected_n = n;
+        a2.work_iters = b2.work_iters = 300;
+        a2.seed = 77;
+        b2.seed = 88;
+        a2.hits = hits_a2;
+        b2.hits = hits_b2;
+        a2.bad_n = b2.bad_n = &bad_n;
+        a2.clock = b2.clock = &clock;
+        a2.start_at = start_a2;
+        a2.finish_at = finish_a2;
+        b2.start_at = start_b2;
+        b2.finish_at = finish_b2;
+        TaskID live_a = t->runAsyncWithDeps(&a2, n, no_deps);
+        std::vector<TaskID> dep_live;
+        dep_live.push_back(live_a);
+        dep_live.push_back(live_a);
+        t->runAsyncWithDeps(&b2, n, dep_live);
+        t->sync();
+        if (!hitsMatch(hits_a2, NULL, n, a2.work_iters, a2.seed) ||
+            !hitsMatch(hits_b2, NULL, n, b2.work_iters, b2.seed) ||
+            !stampsAfter(finish_a2, n, start_b2, n)) {
+            results.passed = false;
+            printf("edge: live duplicate dependency failed\n");
+        }
+        delete [] hits_a;
+        delete [] hits_b;
+        delete [] hits_c;
+        delete [] start_a;
+        delete [] finish_a;
+        delete [] start_b;
+        delete [] finish_b;
+        delete [] start_c;
+        delete [] finish_c;
+        delete [] hits_a2;
+        delete [] hits_b2;
+        delete [] start_a2;
+        delete [] finish_a2;
+        delete [] start_b2;
+        delete [] finish_b2;
+    }
+
+    if (bad_n.load(std::memory_order_relaxed) != 0) {
+        results.passed = false;
+        printf("edge: a launch saw the wrong num_total_tasks\n");
+    }
+
+    results.time = CycleTimer::currentSeconds() - start_time;
     return results;
+}
+
+TestResults customEdgeCasesSync(ITaskSystem* t) {
+    return customEdgeCases(t, false);
+}
+
+TestResults customEdgeCasesAsync(ITaskSystem* t) {
+    return customEdgeCases(t, true);
 }
 
 /*
