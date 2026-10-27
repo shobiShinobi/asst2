@@ -13,7 +13,63 @@ inline void cpuPause() {
 #endif
 }
 
+// A slice bigger than this is split so idle workers can steal half.
+// Smaller slices are run whole; splitting them costs more than the work.
+const int kSplitAt = 8;
+
 }  // namespace
+
+bool TaskSystemParallelThreadPoolSleeping::WorkDeque::push(Chunk c) {
+    int b = bottom.load(std::memory_order_relaxed);
+    int t = top.load(std::memory_order_acquire);
+    if (b - t >= kCap - 1) {
+        return false;
+    }
+    buf[b & (kCap - 1)] = c;
+    bottom.store(b + 1, std::memory_order_release);
+    return true;
+}
+
+bool TaskSystemParallelThreadPoolSleeping::WorkDeque::pop(Chunk* out) {
+    int b = bottom.load(std::memory_order_relaxed) - 1;
+    bottom.store(b, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    int t = top.load(std::memory_order_relaxed);
+    if (t <= b) {
+        *out = buf[b & (kCap - 1)];
+        if (t == b) {
+            // compare_exchange overwrites t on failure. Keep the old
+            // top so bottom lands just past this slot, not one further.
+            int old_t = t;
+            if (!top.compare_exchange_strong(t, old_t + 1,
+                                             std::memory_order_seq_cst,
+                                             std::memory_order_relaxed)) {
+                bottom.store(old_t + 1, std::memory_order_relaxed);
+                return false;
+            }
+            bottom.store(old_t + 1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    bottom.store(t, std::memory_order_relaxed);
+    return false;
+}
+
+bool TaskSystemParallelThreadPoolSleeping::WorkDeque::steal(Chunk* out) {
+    int t = top.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    int b = bottom.load(std::memory_order_acquire);
+    if (t >= b) {
+        return false;
+    }
+    *out = buf[t & (kCap - 1)];
+    if (!top.compare_exchange_strong(t, t + 1,
+                                     std::memory_order_seq_cst,
+                                     std::memory_order_relaxed)) {
+        return false;
+    }
+    return true;
+}
 
 
 IRunnable::~IRunnable() {}
@@ -136,10 +192,13 @@ void TaskSystemParallelThreadPoolSpinning::sync() {
  * Parallel Thread Pool Sleeping Task System Implementation
  * ================================================================
  *
- * Workers sleep on work_cv_ when the ready queue is empty.
- * A launch sits in the waiting set (unmet > 0) until every dependency
- * has finished. The last task of a launch moves dependents whose unmet
- * count hits zero onto the ready queue and wakes sleepers.
+ * Each worker has its own deque of chunks (a launch id plus a task
+ * range). The owner takes tasks from the back. A thief takes tasks
+ * from the front, so whoever is busy keeps going and an idle worker
+ * can peel work off without waiting on one shared queue.
+ * A launch with unmet dependencies stays parked. The last task of a
+ * launch wakes dependents whose unmet count hits zero.
+ * Workers sleep on work_cv_ when every deque is empty.
  * sync() sleeps on sync_cv_ until unfinished_ drops to zero.
  */
 
@@ -152,11 +211,16 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
       num_threads_(num_threads < 1 ? 1 : num_threads),
       shutdown_(false),
       unfinished_(0),
-      ready_count_(0) {
+      ready_count_(0),
+      injector_(NULL) {
+    deques_.reserve(num_threads_);
     workers_.reserve(num_threads_);
     for (int i = 0; i < num_threads_; i++) {
+        deques_.push_back(std::unique_ptr<WorkDeque>(new WorkDeque()));
+    }
+    for (int i = 0; i < num_threads_; i++) {
         workers_.push_back(std::thread(
-            &TaskSystemParallelThreadPoolSleeping::workerLoop, this));
+            &TaskSystemParallelThreadPoolSleeping::workerLoop, this, i));
     }
 }
 
@@ -171,6 +235,13 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     }
 }
 
+void TaskSystemParallelThreadPoolSleeping::wakeIfIdle(int prev_count) {
+    if (prev_count == 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        work_cv_.notify_all();
+    }
+}
+
 void TaskSystemParallelThreadPoolSleeping::enqueueReady(TaskID id) {
     // Caller holds mutex_.
     Launch* launch = launches_[id].get();
@@ -181,12 +252,124 @@ void TaskSystemParallelThreadPoolSleeping::enqueueReady(TaskID id) {
     if (launch->queued) {
         return;
     }
-    bool wake = ready_.empty();
     launch->queued = true;
-    ready_.push(id);
-    ready_count_.store((int)ready_.size(), std::memory_order_release);
-    if (wake) {
+
+    // One chunk for the whole launch. The worker that pops it splits
+    // the range onto its own deque; the others steal from there.
+    nodes_.emplace_back();
+    INode* node = &nodes_.back();
+    node->chunk.id = id;
+    node->chunk.launch = launch;
+    node->chunk.lo = 0;
+    node->chunk.hi = launch->total;
+    node->next.store(NULL, std::memory_order_relaxed);
+
+    INode* head = injector_.load(std::memory_order_relaxed);
+    do {
+        node->next.store(head, std::memory_order_relaxed);
+    } while (!injector_.compare_exchange_weak(head, node,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed));
+
+    int prev = ready_count_.fetch_add(1, std::memory_order_release);
+    if (prev == 0) {
         work_cv_.notify_all();
+    }
+}
+
+bool TaskSystemParallelThreadPoolSleeping::popOwn(int tid, Chunk* out) {
+    if (!deques_[tid]->pop(out)) {
+        return false;
+    }
+    ready_count_.fetch_sub(1, std::memory_order_release);
+    return true;
+}
+
+bool TaskSystemParallelThreadPoolSleeping::steal(int tid, Chunk* out) {
+    for (int k = 1; k < num_threads_; k++) {
+        int victim = (tid + k) % num_threads_;
+        if (deques_[victim]->steal(out)) {
+            ready_count_.fetch_sub(1, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TaskSystemParallelThreadPoolSleeping::popInjector(Chunk* out) {
+    INode* head = injector_.load(std::memory_order_acquire);
+    while (head != NULL) {
+        INode* next = head->next.load(std::memory_order_relaxed);
+        if (injector_.compare_exchange_weak(head, next,
+                                            std::memory_order_acquire,
+                                            std::memory_order_acquire)) {
+            *out = head->chunk;
+            ready_count_.fetch_sub(1, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+void TaskSystemParallelThreadPoolSleeping::publishSplit(int tid, Chunk chunk) {
+    int n = chunk.hi - chunk.lo;
+    if (n <= kSplitAt) {
+        runChunk(chunk);
+        return;
+    }
+
+    int pieces = n < num_threads_ ? n : num_threads_;
+    int base = n / pieces;
+    int rem = n % pieces;
+    int cursor = chunk.lo;
+    int published = 0;
+    for (int i = 0; i < pieces - 1; i++) {
+        int len = base + (i < rem ? 1 : 0);
+        Chunk part;
+        part.id = chunk.id;
+        part.launch = chunk.launch;
+        part.lo = cursor;
+        part.hi = cursor + len;
+        cursor += len;
+        if (deques_[tid]->push(part)) {
+            published++;
+        } else {
+            runChunk(part);
+        }
+    }
+    if (published > 0) {
+        int prev = ready_count_.fetch_add(published, std::memory_order_release);
+        wakeIfIdle(prev);
+    }
+
+    Chunk mine;
+    mine.id = chunk.id;
+    mine.launch = chunk.launch;
+    mine.lo = cursor;
+    mine.hi = chunk.hi;
+    // The piece we kept can still be bigger than the others when
+    // num_threads does not divide the range. Split again so it
+    // does not sit on one worker.
+    if (mine.hi - mine.lo > kSplitAt) {
+        publishSplit(tid, mine);
+    } else {
+        runChunk(mine);
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::runChunk(Chunk chunk) {
+    Launch* launch = chunk.launch;
+    int count = chunk.hi - chunk.lo;
+    if (count <= 0) {
+        return;
+    }
+    for (int t = chunk.lo; t < chunk.hi; t++) {
+        launch->runnable->runTask(t, launch->total);
+    }
+    int prev = launch->remaining.fetch_sub(count, std::memory_order_acq_rel);
+    if (prev == count) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        markComplete(chunk.id);
     }
 }
 
@@ -213,66 +396,32 @@ void TaskSystemParallelThreadPoolSleeping::markComplete(TaskID id) {
     }
 }
 
-void TaskSystemParallelThreadPoolSleeping::workerLoop() {
-    std::unique_lock<std::mutex> lock(mutex_);
+void TaskSystemParallelThreadPoolSleeping::workerLoop(int tid) {
     while (true) {
-        while (!shutdown_ && ready_.empty()) {
-            // A dependent launch is often queued a few microseconds after
-            // the early workers finish. Spin before sleeping so a chain
-            // of bulk launches does not pay a wake-up every step.
-            lock.unlock();
+        Chunk chunk;
+        if (!popOwn(tid, &chunk) && !steal(tid, &chunk) && !popInjector(&chunk)) {
+            // A dependent launch usually shows up a few microseconds
+            // after the early workers finish. Spin before sleeping so
+            // a chain of bulk launches does not pay a wake-up every step.
             for (int spins = 0; spins < 12000; spins++) {
                 if (ready_count_.load(std::memory_order_acquire) > 0) {
                     break;
                 }
                 cpuPause();
             }
-            lock.lock();
-            if (!ready_.empty() || shutdown_) {
-                break;
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (shutdown_) {
+                return;
             }
-            work_cv_.wait(lock);
-        }
-        if (shutdown_) {
-            return;
-        }
-
-        TaskID id = ready_.front();
-        Launch* launch = launches_[id].get();
-        lock.unlock();
-
-        int task = launch->next.fetch_add(1, std::memory_order_relaxed);
-        if (task >= launch->total) {
-            {
-                std::lock_guard<std::mutex> guard(mutex_);
-                if (!ready_.empty() && ready_.front() == id &&
-                    launch->next.load(std::memory_order_relaxed) >= launch->total) {
-                    ready_.pop();
-                    launch->queued = false;
-                    ready_count_.store((int)ready_.size(), std::memory_order_release);
-                }
+            if (ready_count_.load(std::memory_order_acquire) == 0) {
+                work_cv_.wait(lock);
             }
-            lock.lock();
+            if (shutdown_) {
+                return;
+            }
             continue;
         }
-
-        launch->runnable->runTask(task, launch->total);
-
-        int prev = launch->remaining.fetch_sub(1, std::memory_order_acq_rel);
-        if (prev == 1) {
-            std::lock_guard<std::mutex> guard(mutex_);
-            // Drop this launch from the ready queue if every index
-            // has already been claimed, then wake dependents.
-            if (!ready_.empty() && ready_.front() == id &&
-                launch->next.load(std::memory_order_relaxed) >= launch->total) {
-                ready_.pop();
-                launch->queued = false;
-                ready_count_.store((int)ready_.size(), std::memory_order_release);
-            }
-            markComplete(id);
-        }
-
-        lock.lock();
+        publishSplit(tid, chunk);
     }
 }
 

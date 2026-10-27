@@ -4,9 +4,9 @@
 #include "itasksys.h"
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
 
@@ -95,12 +95,52 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
                   unmet(0), queued(false), done(false) {}
         };
 
-        void workerLoop();
+        // A slice of one launch. Workers run these, and a busy worker
+        // can leave a slice on its deque for someone else to steal.
+        struct Chunk {
+            TaskID id;
+            Launch* launch;
+            int lo;
+            int hi;
+        };
+
+        // Lock-free deque. The owner pushes and pops at the bottom.
+        // Thieves pop at the top. Fixed capacity so we never allocate
+        // on the steal path.
+        struct WorkDeque {
+            static const int kCap = 1024;
+            Chunk buf[kCap];
+            std::atomic<int> top;
+            std::atomic<int> bottom;
+
+            WorkDeque() : top(0), bottom(0) {}
+
+            bool push(Chunk c);
+            bool pop(Chunk* out);
+            bool steal(Chunk* out);
+        };
+
+        // New launches land here. Only the thread that calls
+        // runAsync / markComplete pushes. Any worker may pop.
+        struct INode {
+            Chunk chunk;
+            std::atomic<INode*> next;
+            INode() : next(NULL) {}
+        };
+
+        void workerLoop(int tid);
+        bool popOwn(int tid, Chunk* out);
+        bool steal(int tid, Chunk* out);
+        bool popInjector(Chunk* out);
+        void publishSplit(int tid, Chunk chunk);
+        void runChunk(Chunk chunk);
         void enqueueReady(TaskID id);
         void markComplete(TaskID id);
+        void wakeIfIdle(int prev_count);
 
         int num_threads_;
         std::vector<std::thread> workers_;
+        std::vector<std::unique_ptr<WorkDeque> > deques_;
 
         std::mutex mutex_;
         std::condition_variable work_cv_;
@@ -108,9 +148,12 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         bool shutdown_;
         int unfinished_;
         std::atomic<int> ready_count_;
+        std::atomic<INode*> injector_;
+        // Stable addresses. Grown only while mutex_ is held, and only
+        // before the node is published to a worker.
+        std::deque<INode> nodes_;
 
         std::vector<std::unique_ptr<Launch> > launches_;
-        std::queue<TaskID> ready_;
 };
 
 #endif
