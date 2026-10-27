@@ -58,11 +58,21 @@ typedef struct {
  * ==================================================================
 */
 /*
- * Custom test: edge cases.
+ * Custom tests (Part C).
  *
- * Prediction, written before looking at timings:
- * async should match sync on the tiny tasks, because there is almost
- * no overlapping work. A missed wake-up hangs the test.
+ * Predictions, written before looking at timings:
+ *  - edge cases: async should match sync on the tiny tasks, because there
+ *    is almost no overlapping work. A missed wake-up hangs the test.
+ *  - skewed cost: dynamic assignment should land near T1/P.
+ *    Static contiguous should be about R times worse, with R near
+ *    (0.05*50 + 0.95*1) / 1  concentrated on one chunk, so the loaded
+ *    thread does most of the 50x work and R is well above 2.
+ *    Static interleaved with period == P should be just as skewed,
+ *    because one thread receives every expensive id.
+ *  - parallel chains: sync run() walks chains one launch at a time, so
+ *    only 2 tasks are ever in flight. Async keeps K chains in flight.
+ *    Expected async/sync speedup is about min(K, P/2), cut down by
+ *    per-launch sleep overhead when the tasks are short.
  */
 
 static int busyMix(int iters, int seed) {
@@ -408,6 +418,227 @@ TestResults customEdgeCasesSync(ITaskSystem* t) {
 
 TestResults customEdgeCasesAsync(ITaskSystem* t) {
     return customEdgeCases(t, true);
+}
+
+/*
+ * N=320. The first 5% of task ids do 50x the iterations of the rest.
+ * output[i] is checked against the same mix the task is supposed to run.
+ */
+class SkewTask : public IRunnable {
+    public:
+        int* out;
+        int cheap_iters;
+        int expensive_iters;
+        int stride; // 0 => first 5% are expensive, else i % stride == 0
+
+        SkewTask(int* out, int cheap, int expensive, int stride)
+            : out(out), cheap_iters(cheap), expensive_iters(expensive), stride(stride) {}
+
+        void runTask(int task_id, int num_total_tasks) {
+            bool hot = false;
+            if (stride <= 0) {
+                hot = task_id < (num_total_tasks / 20);
+            } else {
+                hot = (task_id % stride) == 0;
+            }
+            int iters = hot ? expensive_iters : cheap_iters;
+            out[task_id] = busyMix(iters, task_id);
+        }
+};
+
+static bool skewMatches(int* out, int n, int cheap, int expensive, int stride) {
+    int hot_count = (stride <= 0) ? (n / 20) : 0;
+    for (int i = 0; i < n; i++) {
+        bool hot = (stride <= 0) ? (i < hot_count) : ((i % stride) == 0);
+        int iters = hot ? expensive : cheap;
+        if (out[i] != busyMix(iters, i)) {
+            printf("skew: task %d got %d\n", i, out[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+TestResults customSkewedCost(ITaskSystem* t) {
+    const int n = 320;
+    const int cheap = 40000;
+    const int expensive = cheap * 50;
+    int* out = new int[n];
+    TestResults results;
+    results.passed = true;
+
+    SkewTask contiguous(out, cheap, expensive, 0);
+    double start_time = CycleTimer::currentSeconds();
+    t->run(&contiguous, n);
+    double mid = CycleTimer::currentSeconds();
+    if (!skewMatches(out, n, cheap, expensive, 0)) {
+        results.passed = false;
+    }
+
+    // Period 8: with static interleaved assignment and P dividing 8,
+    // thread 0 gets every expensive task.
+    SkewTask striped(out, cheap, expensive, 8);
+    t->run(&striped, n);
+    double end_time = CycleTimer::currentSeconds();
+    if (!skewMatches(out, n, cheap, expensive, 8)) {
+        results.passed = false;
+    }
+
+    printf("skew contiguous %.3f ms, stride-8 %.3f ms\n",
+           (mid - start_time) * 1000.0, (end_time - mid) * 1000.0);
+    results.time = end_time - start_time;
+    delete [] out;
+    return results;
+}
+
+/*
+ * K chains of M bulk launches, 2 tasks each. Sync issues run()
+ * chain-by-chain. Async gives each stage a dependency on the previous
+ * stage of the same chain only, so the K chains overlap, then one join
+ * launch waits for every tail.
+ */
+class ChainStage : public IRunnable {
+    public:
+        int work_iters;
+        int seed;
+        int* out;
+        std::atomic<long long>* clock;
+        std::atomic<long long>* start_at;
+        std::atomic<long long>* finish_at;
+
+        ChainStage()
+            : work_iters(0), seed(0), out(NULL), clock(NULL),
+              start_at(NULL), finish_at(NULL) {}
+
+        void runTask(int task_id, int num_total_tasks) {
+            long long s = clock->fetch_add(1, std::memory_order_relaxed);
+            start_at[task_id].store(s, std::memory_order_relaxed);
+            out[task_id] = busyMix(work_iters, seed + task_id);
+            long long f = clock->fetch_add(1, std::memory_order_relaxed);
+            finish_at[task_id].store(f, std::memory_order_relaxed);
+            (void)num_total_tasks;
+        }
+};
+
+class ChainJoin : public IRunnable {
+    public:
+        std::atomic<int>* flag;
+        ChainJoin(std::atomic<int>* flag) : flag(flag) {}
+        void runTask(int task_id, int num_total_tasks) {
+            (void)task_id;
+            (void)num_total_tasks;
+            flag->store(1, std::memory_order_relaxed);
+        }
+};
+
+static bool runChainSweep(ITaskSystem* t, bool do_async, int K, int M,
+                           int work_iters, double* elapsed) {
+    const int tasks_per = 2;
+    std::atomic<long long> clock(1);
+    std::vector<ChainStage> stages(K * M);
+    std::vector<int*> outs(K * M);
+    std::vector<std::atomic<long long>*> starts(K * M);
+    std::vector<std::atomic<long long>*> finishes(K * M);
+
+    for (int i = 0; i < K * M; i++) {
+        outs[i] = new int[tasks_per];
+        starts[i] = new std::atomic<long long>[tasks_per];
+        finishes[i] = new std::atomic<long long>[tasks_per];
+        for (int j = 0; j < tasks_per; j++) {
+            starts[i][j].store(0, std::memory_order_relaxed);
+            finishes[i][j].store(0, std::memory_order_relaxed);
+        }
+        stages[i].work_iters = work_iters;
+        stages[i].seed = 100 * i;
+        stages[i].out = outs[i];
+        stages[i].clock = &clock;
+        stages[i].start_at = starts[i];
+        stages[i].finish_at = finishes[i];
+    }
+
+    std::atomic<int> joined(0);
+    ChainJoin join(&joined);
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        std::vector<TaskID> tails;
+        for (int k = 0; k < K; k++) {
+            std::vector<TaskID> deps;
+            TaskID prev = -1;
+            for (int m = 0; m < M; m++) {
+                prev = t->runAsyncWithDeps(&stages[k * M + m], tasks_per, deps);
+                deps.clear();
+                deps.push_back(prev);
+            }
+            tails.push_back(prev);
+        }
+        t->runAsyncWithDeps(&join, 1, tails);
+        t->sync();
+    } else {
+        for (int k = 0; k < K; k++) {
+            for (int m = 0; m < M; m++) {
+                t->run(&stages[k * M + m], tasks_per);
+            }
+        }
+        t->run(&join, 1);
+    }
+    *elapsed = CycleTimer::currentSeconds() - start_time;
+
+    bool ok = joined.load(std::memory_order_relaxed) == 1;
+    for (int k = 0; k < K && ok; k++) {
+        for (int m = 0; m < M && ok; m++) {
+            int idx = k * M + m;
+            for (int j = 0; j < tasks_per; j++) {
+                if (outs[idx][j] != busyMix(work_iters, stages[idx].seed + j)) {
+                    ok = false;
+                }
+            }
+            if (m > 0) {
+                int prev = k * M + (m - 1);
+                if (!stampsAfter(finishes[prev], tasks_per, starts[idx], tasks_per)) {
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < K * M; i++) {
+        delete [] outs[i];
+        delete [] starts[i];
+        delete [] finishes[i];
+    }
+    return ok;
+}
+
+TestResults customParallelChains(ITaskSystem* t, bool do_async) {
+    // Three widths. K=8 is the one reported as the test time.
+    const int ks[3] = {2, 4, 8};
+    const int M = 8;
+    const int work_iters = 900000;
+    TestResults results;
+    results.passed = true;
+    results.time = 0;
+    for (int i = 0; i < 3; i++) {
+        double elapsed = 0;
+        bool ok = runChainSweep(t, do_async, ks[i], M, work_iters, &elapsed);
+        printf("chains K=%d %s %.3f ms\n", ks[i], do_async ? "async" : "sync",
+               elapsed * 1000.0);
+        if (!ok) {
+            results.passed = false;
+            printf("chains K=%d failed\n", ks[i]);
+        }
+        if (ks[i] == 8) {
+            results.time = elapsed;
+        }
+    }
+    return results;
+}
+
+TestResults customParallelChainsSync(ITaskSystem* t) {
+    return customParallelChains(t, false);
+}
+
+TestResults customParallelChainsAsync(ITaskSystem* t) {
+    return customParallelChains(t, true);
 }
 
 /*
